@@ -144,8 +144,8 @@ def generate_filename(team_handle: str, design_slug: str, product_id: str, view_
     
     return filename
 
-@app.get("/healthz")
-def healthz():
+@app.get("/health")
+def health():
     """Health check endpoint"""
     return {"status": "ok", "version": "preproc-1.0"}
 
