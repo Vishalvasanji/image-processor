@@ -254,32 +254,20 @@ async def normalize(
     
     log.info(f"Processing complete: {filename}")
     
-    # STEP 10: Return multipart response
-    boundary = "PREPROCESSOR_BOUNDARY"
-    
-    def generate_multipart():
-        # Part 1: Image
-        yield f"--{boundary}\r\n".encode()
-        yield f'Content-Disposition: form-data; name="image"; filename="{filename}"\r\n'.encode()
-        yield b"Content-Type: image/png\r\n\r\n"
-        yield png_bytes
-        yield b"\r\n"
-        
-        # Part 2: Metadata
-        yield f"--{boundary}\r\n".encode()
-        yield b'Content-Disposition: form-data; name="meta"\r\n'
-        yield b"Content-Type: application/json\r\n\r\n"
-        yield json.dumps(meta, indent=2).encode()
-        yield b"\r\n"
-        
-        # End boundary
-        yield f"--{boundary}--\r\n".encode()
-    
+    # STEP 10: Return PNG image with metadata in headers
     headers = {
-        "Content-Type": f"multipart/form-data; boundary={boundary}"
+        "Content-Type": "image/png",
+        "Content-Disposition": f'inline; filename="{filename}"',
+        "X-Image-Width": str(cs),
+        "X-Image-Height": str(cs),
+        "X-Bbox-Source": bbox_source,
+        "X-Scale-Factor": str(round(scale, 4)),
+        "X-Filesize-Bytes": str(len(png_bytes)),
+        "X-Content-Hash": f"sha1:{content_hash}",
+        "X-Filename": filename
     }
     
-    return StreamingResponse(generate_multipart(), headers=headers)
+    return Response(content=png_bytes, media_type="image/png", headers=headers)
 
 
 if __name__ == "__main__":
