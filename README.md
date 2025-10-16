@@ -1,2 +1,2 @@
-# image-preprocessor
-Image preprocessing service for Sideline Social
+# image-processing
+Image processing service for Sideline Social
