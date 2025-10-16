@@ -12,9 +12,9 @@ from PIL import Image, ImageOps, ImageEnhance, ImageCms
 # App & Logging
 # =========================
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("preprocessor")
+log = logging.getLogger("Processor")
 
-app = FastAPI(title="Image Preprocessor", version="preproc-1.0")
+app = FastAPI(title="Image Processor", version="preproc-1.0")
 BUILD_ID = "2025-10-16-no-multipart-v2"
 
 # Optional request/response logger
