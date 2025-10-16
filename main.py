@@ -4,7 +4,7 @@ import hashlib
 import logging
 from typing import Optional, Tuple
 
-from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Body, HTTPException, Request, Query
 from fastapi.responses import Response
 from PIL import Image, ImageOps, ImageEnhance, ImageCms
 
@@ -19,15 +19,14 @@ log = logging.getLogger("preprocessor")
 # ------------------------------------------------------------
 app = FastAPI(title="Image Preprocessor", version="preproc-1.0")
 
-# (Optional) request logger for debugging input shape
+# Optional request/response logger (helps debug 422s / client content-types)
 @app.middleware("http")
 async def log_request(request: Request, call_next):
     try:
         body = await request.body()
         log.info(
             f"REQUEST {request.method} {request.url.path} "
-            f"CT={request.headers.get('content-type')} "
-            f"Len={len(body)}"
+            f"CT={request.headers.get('content-type')} Len={len(body)}"
         )
     except Exception:
         pass
@@ -40,14 +39,15 @@ async def log_request(request: Request, call_next):
 # ------------------------------------------------------------
 def attach_srgb(img: Image.Image) -> Image.Image:
     try:
-        if "icc_profile" in img.info and img.info["icc_profile"]:
-            src = ImageCms.ImageCmsProfile(io.BytesIO(img.info["icc_profile"]))
+        icc = img.info.get("icc_profile")
+        if icc:
+            src = ImageCms.ImageCmsProfile(io.BytesIO(icc))
             dst = ImageCms.createProfile("sRGB")
             img = ImageCms.profileToProfile(img, src, dst, outputMode=img.mode)
         return img
     except Exception as e:
         log.warning(f"sRGB attach failed: {e}")
-        return img
+        return img  # fall back silently
 
 def decode_pil_from_bytes(raw: bytes) -> Image.Image:
     if not raw:
@@ -113,20 +113,23 @@ def healthz():
 
 @app.post("/normalize", response_class=Response)
 async def normalize(
-    # Accept EITHER multipart or raw bytes
+    # Accept EITHER multipart or raw bytes:
     file: UploadFile | None = File(None, description="Upload file as multipart field named 'file'"),
     body: bytes | None = Body(None, description="Raw image bytes if not sending multipart"),
-    # Options (can be form fields or query params)
-    max_side: int = Form(2048),
-    pad_square: bool = Form(True),
-    bg: Optional[str] = Form(None),
-    autocrop: bool = Form(True),
-    brightness: float = Form(1.0),
-    contrast: float = Form(1.0),
-    filename: Optional[str] = Form("normalized.png"),
+    # Options as QUERY PARAMS (works for both multipart and raw)
+    max_side: int = Query(2048),
+    pad_square: bool = Query(True),
+    bg: Optional[str] = Query(None),
+    autocrop: bool = Query(True),
+    brightness: float = Query(1.0),
+    contrast: float = Query(1.0),
+    filename: Optional[str] = Query("normalized.png"),
 ):
     """
-    Returns ONLY PNG bytes (no multipart). Any metadata is placed into headers.
+    Normalize the image and return ONLY PNG bytes.
+    - Accepts multipart (field 'file') or raw image body
+    - Options passed via query params (works with either content type)
+    - Metadata exposed via headers (no multipart wrapping)
     """
     try:
         # 1) Decode source
@@ -148,7 +151,7 @@ async def normalize(
         img, scale = scale_to_max(img, max_side)
         img = apply_tone(img, brightness=brightness, contrast=contrast)
 
-        # 3) Encode to PNG (flatten if opaque bg requested)
+        # 3) Encode PNG (flatten if opaque bg requested)
         buf = io.BytesIO()
         if bg_rgba[3] == 255:  # opaque
             flat = Image.new("RGB", img.size, bg_rgba[:3])
@@ -165,6 +168,7 @@ async def normalize(
             "X-Content-Hash": f"sha1:{sha1_digest(png_bytes)}",
         }
 
+        # Return ONLY PNG bytes
         return Response(content=png_bytes, media_type="image/png", headers=headers)
 
     except HTTPException:
@@ -173,6 +177,7 @@ async def normalize(
         log.exception("Normalize failed")
         raise HTTPException(status_code=400, detail=f"Normalize failed: {e}")
 
+# Local run
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))
