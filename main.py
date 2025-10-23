@@ -227,54 +227,130 @@ def clamp_box(x, y, w, h, W, H, pad_px=0):
     h = min(H - y, h + 2 * pad_px)
     return x, y, w, h
 
+def _is_plausible_garment_box(x, y, w, h, W, H,
+                              min_w_ratio=0.40,   # at least 40% of width
+                              min_h_ratio=0.35,   # at least 35% of height
+                              min_area_ratio=0.20 # at least 20% of area
+                             ):
+    wr = w / float(W)
+    hr = h / float(H)
+    ar = (w * h) / float(W * H)
+    return (wr >= min_w_ratio) and (hr >= min_h_ratio) and (ar >= min_area_ratio)
+
+def _largest_contour_bbox(binary_mask):
+    cnts, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    c = max(cnts, key=cv2.contourArea)
+    return cv2.boundingRect(c)  # (x,y,w,h)
+
+def _detect_bbox_threshold(bgr):
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    kernel = np.ones((5, 5), np.uint8)
+    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
+    th = cv2.morphologyEx(th, cv2.MORPH_OPEN,  kernel, iterations=1)
+    return _largest_contour_bbox(th)
+
+def _detect_bbox_edge(bgr):
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 30, 150)
+    # thicken edges slightly, then fill contour
+    dil = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
+    return _largest_contour_bbox(dil)
+
+def _detect_bbox_grabcut(bgr, rect_scale=0.75, iters=4):
+    H, W = bgr.shape[:2]
+    w0, h0 = int(W*rect_scale), int(H*rect_scale)
+    x0, y0 = (W - w0)//2, (H - h0)//2
+    mask = np.zeros((H, W), np.uint8)
+    bgdModel = np.zeros((1, 65), np.float64)
+    fgdModel = np.zeros((1, 65), np.float64)
+    cv2.grabCut(bgr, mask, (x0,y0,w0,h0), bgdModel, fgdModel, iters, cv2.GC_INIT_WITH_RECT)
+    fg = np.where((mask==cv2.GC_FGD) + (mask==cv2.GC_PR_FGD), 255, 0).astype('uint8')
+    kernel = np.ones((5,5), np.uint8)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return _largest_contour_bbox(fg)
+
 # ---------- 1) Detect bounding box ----------
 @app.post("/detect-bbox")
 async def detect_bbox(
     file: UploadFile = File(...),
-    pad_ratio: float = Form(0.02),       # 2% padding around the garment
-    min_area_ratio: float = Form(0.05)   # ignore contours < 5% of image area
+    pad_ratio: float = Form(0.005),       # your tuned default
+    min_area_ratio: float = Form(0.05),   # filter tiny blobs in the first pass
+    mode: str = Form("auto")              # "auto" | "threshold" | "edge" | "grabcut"
 ):
-    # Uses your existing helper to normalize to RGBA
     pil_rgba = decode_to_rgba(file)
     W, H = pil_rgba.size
+    bgr = cv2.cvtColor(np.array(pil_rgba.convert("RGB")), cv2.COLOR_RGB2BGR)
 
-    cv_bgra = pil_to_cv_bgra(pil_rgba)
-    bgr = cv2.cvtColor(cv_bgra, cv2.COLOR_BGRA2BGR)
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    def pad_and_clamp(x, y, w, h):
+        pad_px = int(round(pad_ratio * max(W, H)))
+        x = max(0, x - pad_px); y = max(0, y - pad_px)
+        w = min(W - x, w + 2*pad_px); h = min(H - y, h + 2*pad_px)
+        return x, y, w, h
 
-    # Otsu + morphology (robust on studio mockups)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    kernel = np.ones((7, 7), np.uint8)
-    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=2)
-    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
+    tried = []
+    bbox = None
+    confidence = 0.9
 
-    cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return JSONResponse({"ok": False, "reason": "no_contours"})
+    def attempt(method_name):
+        if method_name == "threshold":
+            return _detect_bbox_threshold(bgr)
+        if method_name == "edge":
+            return _detect_bbox_edge(bgr)
+        if method_name == "grabcut":
+            # speed optimization: downscale for grabcut and rescale back
+            scale = 1000.0 / max(W, H) if max(W, H) > 1000 else 1.0
+            if scale < 1.0:
+                small = cv2.resize(bgr, (int(W*scale), int(H*scale)), interpolation=cv2.INTER_AREA)
+                bb = _detect_bbox_grabcut(small, rect_scale=0.75, iters=4)
+                if bb:
+                    sx, sy, sw, sh = [int(round(v/scale)) for v in bb]
+                    return (sx, sy, sw, sh)
+                return None
+            else:
+                return _detect_bbox_grabcut(bgr, rect_scale=0.75, iters=4)
+        return None
 
-    img_area = W * H
-    min_area = max(1, int(min_area_ratio * img_area))
-    big = [c for c in cnts if cv2.contourArea(c) >= min_area]
+    order = [mode] if mode in ("threshold", "edge", "grabcut") else ["threshold", "edge", "grabcut"]
 
-    if big:
-        c = max(big, key=cv2.contourArea)
-        confidence = 0.9
-    else:
-        c = max(cnts, key=cv2.contourArea)
-        confidence = 0.4  # small shapes only (logo/noise)
+    for meth in order:
+        tried.append(meth)
+        bb = attempt(meth)
+        if not bb:
+            continue
+        x,y,w,h = bb
+        # Reject obviously-too-small boxes (e.g., front print only)
+        if not _is_plausible_garment_box(x, y, w, h, W, H):
+            # low confidence; try next method
+            confidence = 0.5
+            continue
+        bbox = (x,y,w,h)
+        confidence = 0.9 if meth != "grabcut" else 0.95
+        break
 
-    x, y, w, h = cv2.boundingRect(c)
+    if not bbox:
+        # as a last resort, return the largest box from the last successful method (even if small)
+        for meth in order:
+            bb = attempt(meth)
+            if bb:
+                x,y,w,h = bb
+                bbox = (x,y,w,h)
+                confidence = 0.4
+                break
 
-    # Padding
-    pad_px = int(round(pad_ratio * max(W, H)))
-    x, y, w, h = clamp_box(x, y, w, h, W, H, pad_px)
+    if not bbox:
+        return JSONResponse({"ok": False, "reason": "no_bbox", "tried": tried})
 
+    x,y,w,h = pad_and_clamp(*bbox)
     return {
         "ok": True,
         "bbox": {"x": int(x), "y": int(y), "w": int(w), "h": int(h)},
         "image_size": {"w": W, "h": H},
         "confidence": float(confidence),
+        "mode_tried": tried
     }
 
 # ---------- 2) Crop to a bounding box ----------
