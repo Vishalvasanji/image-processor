@@ -1,11 +1,13 @@
 import io
+import numpy as np
+import cv2
 import os
 import hashlib
 import logging
 from typing import Optional, Tuple
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import Response
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
+from fastapi.responses import JSONResponse
 from PIL import Image, ImageOps, ImageCms, ImageEnhance
 
 # ------------------------------------------------------------
@@ -213,6 +215,95 @@ async def normalize(
         log.exception("Normalize failed")
         raise HTTPException(status_code=400, detail=f"Normalize failed: {e}")
 
+# ---------- Helpers for bbox detection/cropping ----------
+def pil_to_cv_bgra(img: Image.Image) -> np.ndarray:
+    """Pillow RGBA -> OpenCV BGRA numpy array."""
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGBA2BGRA)
+
+def clamp_box(x, y, w, h, W, H, pad_px=0):
+    x = max(0, x - pad_px)
+    y = max(0, y - pad_px)
+    w = min(W - x, w + 2 * pad_px)
+    h = min(H - y, h + 2 * pad_px)
+    return x, y, w, h
+
+# ---------- 1) Detect bounding box ----------
+@app.post("/detect-bbox")
+async def detect_bbox(
+    file: UploadFile = File(...),
+    pad_ratio: float = Form(0.02),       # 2% padding around the garment
+    min_area_ratio: float = Form(0.05)   # ignore contours < 5% of image area
+):
+    # Uses your existing helper to normalize to RGBA
+    pil_rgba = decode_to_rgba(file)
+    W, H = pil_rgba.size
+
+    cv_bgra = pil_to_cv_bgra(pil_rgba)
+    bgr = cv2.cvtColor(cv_bgra, cv2.COLOR_BGRA2BGR)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    # Otsu + morphology (robust on studio mockups)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    kernel = np.ones((7, 7), np.uint8)
+    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=2)
+    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return JSONResponse({"ok": False, "reason": "no_contours"})
+
+    img_area = W * H
+    min_area = max(1, int(min_area_ratio * img_area))
+    big = [c for c in cnts if cv2.contourArea(c) >= min_area]
+
+    if big:
+        c = max(big, key=cv2.contourArea)
+        confidence = 0.9
+    else:
+        c = max(cnts, key=cv2.contourArea)
+        confidence = 0.4  # small shapes only (logo/noise)
+
+    x, y, w, h = cv2.boundingRect(c)
+
+    # Padding
+    pad_px = int(round(pad_ratio * max(W, H)))
+    x, y, w, h = clamp_box(x, y, w, h, W, H, pad_px)
+
+    return {
+        "ok": True,
+        "bbox": {"x": int(x), "y": int(y), "w": int(w), "h": int(h)},
+        "image_size": {"w": W, "h": H},
+        "confidence": float(confidence),
+    }
+
+# ---------- 2) Crop to a bounding box ----------
+@app.post("/crop-to-bbox")
+async def crop_to_bbox(
+    file: UploadFile = File(...),
+    x: int = Form(...),
+    y: int = Form(...),
+    w: int = Form(...),
+    h: int = Form(...),
+    filename: str = Form("crop.png"),
+):
+    pil_rgba = decode_to_rgba(file)
+    W, H = pil_rgba.size
+
+    # Clamp to image bounds
+    x = max(0, min(x, W - 1))
+    y = max(0, min(y, H - 1))
+    w = max(1, min(w, W - x))
+    h = max(1, min(h, H - y))
+
+    cropped = pil_rgba.crop((x, y, x + w, y + h))
+    buf = io.BytesIO()
+    cropped.save(buf, format="PNG", optimize=True)
+    return Response(
+        content=buf.getvalue(),
+        media_type="image/png",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
 
 # ------------------------------------------------------------
 # Local dev
