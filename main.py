@@ -4,196 +4,207 @@ import hashlib
 import logging
 from typing import Optional, Tuple
 
-from fastapi import FastAPI, UploadFile, File, Body, HTTPException, Request, Query
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import Response
-from PIL import Image, ImageOps, ImageEnhance, ImageCms
+from PIL import Image, ImageOps, ImageCms, ImageEnhance
 
-# =========================
-# App & Logging
-# =========================
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("Processor")
+log = logging.getLogger("preprocessor")
 
-app = FastAPI(title="Image Processor", version="preproc-1.0")
-BUILD_ID = "2025-10-16-no-multipart-v2"
+# ------------------------------------------------------------
+# App
+# ------------------------------------------------------------
+app = FastAPI(title="Image Preprocessor", version="preproc-1.0")
 
-# Optional request/response logger
-@app.middleware("http")
-async def log_request(request: Request, call_next):
-    try:
-        body = await request.body()
-        log.info(
-            f"REQUEST {request.method} {request.url.path} "
-            f"CT={request.headers.get('content-type')} Len={len(body)}"
-        )
-    except Exception:
-        pass
-    resp = await call_next(request)
-    log.info(f"RESPONSE {resp.status_code} CT={resp.headers.get('content-type')}")
-    return resp
-
-
-# =========================
+# ------------------------------------------------------------
 # Helpers
-# =========================
+# ------------------------------------------------------------
 def attach_srgb(img: Image.Image) -> Image.Image:
-    """Convert/attach sRGB profile when available (avoid color shifts)."""
+    """
+    Convert/attach sRGB profile to avoid color shifts.
+    Falls back to RGBA conversion if profiles are missing.
+    """
     try:
-        icc = img.info.get("icc_profile")
-        if icc:
-            src = ImageCms.ImageCmsProfile(io.BytesIO(icc))
-            dst = ImageCms.createProfile("sRGB")
-            img = ImageCms.profileToProfile(img, src, dst, outputMode=img.mode)
-        return img
+        # If there's an embedded profile, convert to sRGB.
+        if "icc_profile" in img.info:
+            icc_bytes = img.info.get("icc_profile")
+            if icc_bytes:
+                src = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
+                dst = ImageCms.createProfile("sRGB")
+                intent = ImageCms.INTENT_PERCEPTUAL
+                img = ImageCms.profileToProfile(img, src, dst, renderingIntent=intent, outputMode=img.mode)
+                return img
+        # If no embedded profile, at least set mode consistently.
+        return img.convert("RGBA")
     except Exception as e:
         log.warning(f"sRGB attach failed: {e}")
-        return img  # fall back silently
+        return img.convert("RGBA")
 
-def decode_pil_from_bytes(raw: bytes) -> Image.Image:
-    if not raw:
-        raise ValueError("Empty body")
-    img = Image.open(io.BytesIO(raw))
-    img = ImageOps.exif_transpose(img) or img
-    img = attach_srgb(img)
-    return img.convert("RGBA")
 
-def decode_pil_from_upload(file: UploadFile) -> Image.Image:
-    raw = file.file.read()
-    return decode_pil_from_bytes(raw)
+def decode_to_rgba(file: UploadFile) -> Image.Image:
+    """Read an uploaded file and normalize orientation + color space to RGBA."""
+    try:
+        raw = file.file.read()
+        if not raw:
+            raise ValueError("Empty upload.")
 
-def autocrop_alpha(img: Image.Image) -> Image.Image:
+        img = Image.open(io.BytesIO(raw))
+        img = ImageOps.exif_transpose(img) or img  # fix EXIF orientation
+        img = attach_srgb(img)
+        if img.mode != "RGBA":
+            img = img.convert("RGBA")
+        return img
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to decode image: {e}")
+
+
+def autocrop_alpha(img: Image.Image, bg=(0, 0, 0, 0)) -> Image.Image:
+    """
+    Trim uniform transparent/near-transparent borders.
+    Works on RGBA—uses alpha as primary signal.
+    """
     if img.mode != "RGBA":
         img = img.convert("RGBA")
     alpha = img.split()[-1]
     bbox = alpha.getbbox()
-    return img if not bbox else img.crop(bbox)
+    if not bbox:
+        # Completely transparent; just return as-is to avoid empty crop.
+        return img
+    return img.crop(bbox)
+
 
 def pad_to_square(img: Image.Image, bg=(0, 0, 0, 0)) -> Image.Image:
+    """Pad the image to a square canvas (centered) using bg color."""
     w, h = img.size
     side = max(w, h)
     canvas = Image.new("RGBA", (side, side), bg)
     canvas.paste(img, ((side - w) // 2, (side - h) // 2))
     return canvas
 
+
 def scale_to_max(img: Image.Image, max_side: int) -> Tuple[Image.Image, float]:
+    """Scale so that the largest side == max_side, preserving aspect ratio."""
     w, h = img.size
-    s = max(w, h)
-    if s <= 0:
+    side = max(w, h)
+    if side == 0:
         return img, 1.0
-    if s == max_side:
+    scale = max_side / side
+    if scale == 1.0:
         return img, 1.0
-    r = max_side / s
-    new_size = (max(1, int(round(w * r))), max(1, int(round(h * r))))
-    return img.resize(new_size, Image.LANCZOS), r
+    new_size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+    return img.resize(new_size, Image.LANCZOS), scale
+
 
 def apply_tone(img: Image.Image, brightness: float = 1.0, contrast: float = 1.0) -> Image.Image:
+    """Optionally adjust brightness/contrast (no saturation shift)."""
     if brightness != 1.0:
         img = ImageEnhance.Brightness(img).enhance(brightness)
     if contrast != 1.0:
         img = ImageEnhance.Contrast(img).enhance(contrast)
     return img
 
+
 def parse_bg(bg_hex: Optional[str]) -> Tuple[int, int, int, int]:
+    """Parse hex color (like '#FFFFFF' or 'FFFFFF') to RGBA with full alpha."""
     if not bg_hex:
         return (0, 0, 0, 0)
     s = bg_hex.strip().lstrip("#")
     if len(s) == 6:
-        return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16), 255)
-    if len(s) == 8:
-        return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16), int(s[6:8], 16))
-    raise HTTPException(status_code=400, detail=f"Invalid bg hex: {bg_hex}")
+        r = int(s[0:2], 16)
+        g = int(s[2:4], 16)
+        b = int(s[4:6], 16)
+        return (r, g, b, 255)
+    elif len(s) == 8:
+        r = int(s[0:2], 16)
+        g = int(s[2:4], 16)
+        b = int(s[4:6], 16)
+        a = int(s[6:8], 16)
+        return (r, g, b, a)
+    else:
+        raise HTTPException(status_code=400, detail=f"Invalid bg hex: {bg_hex}")
+
 
 def sha1_digest(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()
 
 
-# =========================
-# Utility Endpoints
-# =========================
+# ------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": app.version}
-
-@app.get("/version")
-def version():
-    return {"build": BUILD_ID}
-
-@app.get("/raw-test", response_class=Response)
-def raw_test():
-    """1x1 transparent PNG to verify raw image/png responses end-to-end."""
-    import base64
-    png_1x1 = base64.b64decode(
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFWgKQWc5TFwAAAABJRU5ErkJggg=="
-    )
-    return Response(
-        png_1x1,
-        media_type="image/png",
-        headers={"Content-Disposition": 'inline; filename="probe.png"', "X-Build": BUILD_ID},
-    )
+    return {"status": "ok", "version": "preproc-1.0"}
 
 
-# =========================
-# Main Endpoint
-# =========================
 @app.post("/normalize", response_class=Response)
 async def normalize(
-    # Accept EITHER multipart (field 'file') OR raw body:
-    file: UploadFile | None = File(None, description="Upload file as multipart field named 'file'"),
-    body: bytes | None = Body(None, description="Raw image bytes if not sending multipart"),
-    # Options as QUERY PARAMS (works with both multipart and raw)
-    max_side: int = Query(2048, description="Largest output side in px"),
-    pad_square: bool = Query(True, description="Pad result to square canvas"),
-    bg: Optional[str] = Query(None, description="Hex bg color, e.g. #FFFFFF; None keeps alpha"),
-    autocrop: bool = Query(True, description="Trim transparent/near-transparent borders"),
-    brightness: float = Query(1.0, description="1.0 = no change"),
-    contrast: float = Query(1.0, description="1.0 = no change"),
-    filename: Optional[str] = Query("normalized.png"),
+    file: UploadFile = File(..., description="Source image file."),
+    # Canvas & transform options
+    max_side: int = Form(2048, description="Largest output side in px (default 2048)."),
+    pad_square: bool = Form(True, description="Pad result to square canvas."),
+    bg: Optional[str] = Form(None, description="Hex bg color (e.g., '#FFFFFF'). None=transparent."),
+    autocrop: bool = Form(True, description="Trim transparent/near-transparent borders."),
+    # Simple tone controls (optional)
+    brightness: float = Form(1.0, description="1.0 = no change"),
+    contrast: float = Form(1.0, description="1.0 = no change"),
+    # Output filename hint (header only; content is raw PNG)
+    filename: Optional[str] = Form("normalized.png"),
 ):
     """
-    Normalize the image and return ONLY PNG bytes.
-    - Body: multipart with 'file' OR raw image bytes
-    - Options: query params (so they work with either body type)
-    - Metadata exposed via headers (no multipart wrapping)
+    Normalize an uploaded image and return ONLY the PNG bytes.
+
+    Pipeline (defaults):
+      1) Decode + EXIF-fix + sRGB -> RGBA
+      2) (Optional) Autocrop transparent borders
+      3) (Optional) Pad to square (centered)
+      4) Scale largest side to `max_side`
+      5) (Optional) Apply simple tone tweaks
+      6) Encode to PNG and RETURN BYTES (media_type='image/png')
     """
     try:
-        # 1) Decode source
-        if file is not None:
-            img = decode_pil_from_upload(file)
-        elif body:
-            img = decode_pil_from_bytes(body)
-        else:
-            raise HTTPException(status_code=422, detail="No image provided. Send multipart field 'file' or raw bytes.")
+        # 1) Decode & color-normalize
+        rgba = decode_to_rgba(file)
 
-        # 2) Pipeline
+        # 2) Autocrop
         if autocrop:
-            img = autocrop_alpha(img)
+            rgba = autocrop_alpha(rgba)
 
+        # 3) Pad to square
         bg_rgba = parse_bg(bg)
         if pad_square:
-            img = pad_to_square(img, bg_rgba)
+            rgba = pad_to_square(rgba, bg_rgba)
 
-        img, scale = scale_to_max(img, max_side)
-        img = apply_tone(img, brightness=brightness, contrast=contrast)
+        # 4) Scale to target
+        rgba, scale = scale_to_max(rgba, max_side=max_side)
 
-        # 3) Encode PNG (flatten if opaque bg requested)
+        # 5) Tone
+        rgba = apply_tone(rgba, brightness=brightness, contrast=contrast)
+
+        # 6) Encode to PNG bytes
         buf = io.BytesIO()
-        if bg_rgba[3] == 255:  # Opaque background requested
-            flat = Image.new("RGB", img.size, bg_rgba[:3])
-            flat.paste(img, mask=img.split()[-1])
+        # If caller asked for opaque background but we still have alpha, flatten
+        if bg_rgba[3] == 255:
+            # Flatten to RGB
+            flat = Image.new("RGB", rgba.size, bg_rgba[:3])
+            flat.paste(rgba, mask=rgba.split()[-1])
             flat.save(buf, format="PNG", optimize=True)
         else:
-            img.save(buf, format="PNG", optimize=True)
+            rgba.save(buf, format="PNG", optimize=True)
 
         png_bytes = buf.getvalue()
+        content_hash = sha1_digest(png_bytes)
+
         headers = {
             "Content-Disposition": f'inline; filename="{filename or "normalized.png"}"',
-            "X-Scale-Factor": f"{scale:.6f}",
+            "X-Scale-Factor": str(round(scale, 4)),
             "X-Filesize-Bytes": str(len(png_bytes)),
-            "X-Content-Hash": f"sha1:{sha1_digest(png_bytes)}",
-            "X-Build": BUILD_ID,
+            "X-Content-Hash": f"sha1:{content_hash}",
         }
 
-        # Return ONLY the PNG bytes
+        # RETURN ONLY PNG BYTES
         return Response(content=png_bytes, media_type="image/png", headers=headers)
 
     except HTTPException:
@@ -203,9 +214,9 @@ async def normalize(
         raise HTTPException(status_code=400, detail=f"Normalize failed: {e}")
 
 
-# =========================
+# ------------------------------------------------------------
 # Local dev
-# =========================
+# ------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))
