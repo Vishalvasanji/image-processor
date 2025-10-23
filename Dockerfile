@@ -10,8 +10,11 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY models ./models
+
 COPY main.py .
 
+ENV U2NET_ONNX_PATH=/app/models/u2netp.onnx
 ENV CANVAS_SIZE=2048
 ENV FILL_RATIO=0.68
 ENV BUFFER_PCT=0.025
