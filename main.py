@@ -4,17 +4,27 @@ import cv2
 import os
 import hashlib
 import logging
-from typing import Optional, Tuple
 
+from typing import Optional, Tuple
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageOps, ImageCms, ImageEnhance
+
+U2NET_ONNX_PATH = os.getenv("U2NET_ONNX_PATH", "models/u2netp.onnx")
+u2net = None
+if os.path.exists(U2NET_ONNX_PATH):
+    try:
+        u2net = cv2.dnn.readNetFromONNX(U2NET_ONNX_PATH)
+        print(f"[init] Loaded U2Net from {U2NET_ONNX_PATH}")
+    except Exception as e:
+        print("[init] Failed to load U2Net:", e)
 
 # ------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("preprocessor")
+
 
 # ------------------------------------------------------------
 # App
@@ -273,6 +283,46 @@ def _detect_bbox_grabcut(bgr, rect_scale=0.75, iters=4):
     fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, kernel, iterations=1)
     return _largest_contour_bbox(fg)
 
+def _u2net_saliency_mask(bgr):
+    """
+    Returns a float mask [0..1], same HxW as input. Requires global u2net.
+    """
+    if u2net is None:
+        return None
+    H, W = bgr.shape[:2]
+    blob = cv2.dnn.blobFromImage(bgr, scalefactor=1/255.0, size=(320,320),
+                                 mean=(0,0,0), swapRB=True, crop=False)
+    u2net.setInput(blob)
+    out = u2net.forward()            # shape: 1x1x320x320
+    sal = out[0,0]
+    sal = 1 / (1 + np.exp(-sal))     # sigmoid
+    sal = cv2.resize(sal, (W, H), interpolation=cv2.INTER_CUBIC)
+    # normalize to [0,1]
+    sal = (sal - sal.min()) / (sal.max() - sal.min() + 1e-8)
+    return sal
+
+def _detect_bbox_ml(bgr, thr=0.35, dilate_ratio=0.01):
+    """
+    Saliency -> threshold -> (optional) dilation -> largest contour -> bbox
+    dilate_ratio controls sleeve/hem inclusion.
+    """
+    sal = _u2net_saliency_mask(bgr)
+    if sal is None:
+        return None
+    H, W = bgr.shape[:2]
+    binm = (sal >= thr).astype(np.uint8) * 255
+    # Expand a hair to catch sleeves/neckline
+    k = max(3, int(round(dilate_ratio * max(W, H))))
+    kernel = np.ones((k, k), np.uint8)
+    binm = cv2.morphologyEx(binm, cv2.MORPH_CLOSE, kernel, iterations=1)
+    binm = cv2.dilate(binm, kernel, iterations=1)
+
+    cnts, _ = cv2.findContours(binm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    c = max(cnts, key=cv2.contourArea)
+    return cv2.boundingRect(c)  # (x,y,w,h)
+
 # ---------- 1) Detect bounding box ----------
 @app.post("/detect-bbox")
 async def detect_bbox(
@@ -314,8 +364,11 @@ async def detect_bbox(
                 return _detect_bbox_grabcut(bgr, rect_scale=0.75, iters=4)
         return None
 
-    order = [mode] if mode in ("threshold", "edge", "grabcut") else ["threshold", "edge", "grabcut"]
-
+    order = ([mode] if mode in ("threshold", "edge", "grabcut", "ml") else ["threshold", "edge", "ml", "grabcut"])
+    def attempt(meth):
+        if meth == "ml":
+            return _detect_bbox_ml(bgr, thr=0.35, dilate_ratio=0.01)
+    
     for meth in order:
         tried.append(meth)
         bb = attempt(meth)
