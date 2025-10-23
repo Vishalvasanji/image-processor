@@ -381,6 +381,28 @@ async def crop_to_bbox(
         headers={"Content-Disposition": f'inline; filename="{filename}"'},
     )
 
+@app.post("/debug-bbox")
+async def debug_bbox(
+    file: UploadFile = File(...),
+    x: int = Form(...),
+    y: int = Form(...),
+    w: int = Form(...),
+    h: int = Form(...)
+):
+    import numpy as np, cv2, io
+    from fastapi import Response
+    from PIL import Image
+
+    data = file.file.read()
+    pil = Image.open(io.BytesIO(data)).convert("RGB")
+    bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+    cv2.rectangle(bgr, (x, y), (x + w, y + h), (0, 255, 0), 6)
+    cv2.putText(bgr, f"{x},{y},{w},{h}", (x, max(0, y - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 2, cv2.LINE_AA)
+    png = cv2.imencode(".png", bgr)[1].tobytes()
+    return Response(content=png, media_type="image/png")
+
+
 # ------------------------------------------------------------
 # Local dev
 # ------------------------------------------------------------
