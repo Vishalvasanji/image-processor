@@ -87,7 +87,7 @@ def _u2net_saliency_mask(bgr):
     sal = (sal - sal.min()) / (sal.max() - sal.min() + 1e-8)
     return sal
 
-def _detect_bbox_ml(bgr, thr=0.33, dilate_ratio=0.015):
+def _detect_bbox_ml(bgr, thr=0.33, dilate_ratio=0.005):
     sal = _u2net_saliency_mask(bgr)
     if sal is None:
         return None
